@@ -139,7 +139,7 @@ def relevant_catalog(question: str, semantic: list[dict]) -> list[dict]:
     return list(found.values())
 
 def add_domain_mappings(catalog: list[dict]) -> list[dict]:
-    """Attach the curated database taxonomy to the matching live course pairs."""
+    """Attach mappings to retrieved candidates without expanding to the whole taxonomy."""
     try:
         _, rows = fetch_rows(
             "SELECT vertical_name, course_name, course_level, domain_name, confidence, reviewed "
@@ -149,17 +149,17 @@ def add_domain_mappings(catalog: list[dict]) -> list[dict]:
         print(f"Course-domain mapping lookup unavailable: {type(error).__name__}: {error}")
         return catalog
     by_pair = {(item.get("vertical"), item.get("course"), item.get("course_level", "Level 1")): item for item in catalog}
+    available_domains = sorted({row[3] for row in rows})
     for vertical, course, level, domain, confidence, reviewed in rows:
         key = (vertical, course, level)
         item = by_pair.get(key)
         if item is None:
-            item = {"vertical": vertical, "course": course, "course_level": level,
-                    "source": "domain_map", "domains": []}
-            catalog.append(item)
-            by_pair[key] = item
+            continue
         item.setdefault("domains", []).append({
             "name": domain, "confidence": float(confidence), "reviewed": bool(reviewed)
         })
+    if catalog:
+        catalog[0]["available_domains"] = available_domains
     return catalog
 
 def interpret_scope(question: str, catalog: list[dict]) -> dict:
@@ -218,17 +218,30 @@ def interpret_scope(question: str, catalog: list[dict]) -> dict:
         for item in catalog for domain in item.get("domains", [])
         if isinstance(domain, dict) and domain.get("name")
     }
+    domain_names.update(
+        name for item in catalog for name in item.get("available_domains", [])
+        if isinstance(name, str)
+    )
     matched_domain = plan.get("matched_domain")
     plan["matched_domain"] = next((
         domain for domain in domain_names
         if isinstance(matched_domain, str) and domain.casefold() == matched_domain.strip().casefold()
     ), None)
     if plan["mode"] == "domain" and plan["matched_domain"]:
-        plan["domain_pairs"] = [
-            {"vertical": item["vertical"], "course": item["course"], "course_level": item["course_level"]}
-            for item in catalog
-            if any(domain.get("name") == plan["matched_domain"] for domain in item.get("domains", []))
-        ]
+        try:
+            _, rows = fetch_rows(
+                "SELECT DISTINCT vertical_name, course_name, course_level "
+                "FROM ps_course_domain_map WHERE LOWER(domain_name) = LOWER(%s) "
+                "ORDER BY vertical_name, course_name, course_level",
+                (plan["matched_domain"],),
+            )
+            plan["domain_pairs"] = [
+                {"vertical": vertical, "course": course, "course_level": level}
+                for vertical, course, level in rows
+            ]
+        except Exception as error:
+            print(f"Domain expansion failed: {type(error).__name__}: {error}")
+            plan["domain_pairs"] = []
     if plan["mode"] == "clarify" and (not plan["exact_pair"] or len(plan["domain_pairs"]) < 2):
         plan["mode"] = "unknown"
     return plan
@@ -276,6 +289,43 @@ def execute_domain_ranking(question: str, plan: dict, structured: bool = False) 
         "The level labels are taken from course names; difficulty itself is not a stored field."
     ) if result else "No students have cleared courses matched to this domain."
     return {"answer": answer, "columns": cols, "rows": result} if structured else answer
+
+def execute_course_catalog_count(structured: bool = False) -> str | dict:
+    """Count normalized titles and their distinct vertical/level offerings directly."""
+    sql = validate_sql(
+        "SELECT COUNT(DISTINCT LOWER(BTRIM(course_name))) AS unique_course_titles, "
+        "COUNT(DISTINCT (LOWER(BTRIM(vertical_name)), LOWER(BTRIM(course_name)), course_level)) "
+        "AS course_level_offerings FROM ps_student_course_summary LIMIT 1"
+    )
+    columns, rows = fetch_rows(sql)
+    titles, offerings = rows[0]
+    answer = (
+        f"There are {titles:,} unique course titles in the student-course database, "
+        f"representing {offerings:,} distinct vertical/course/level offerings."
+    )
+    result = [{"unique_course_titles": str(titles), "course_level_offerings": str(offerings)}]
+    return {"answer": answer, "columns": columns, "rows": result} if structured else answer
+
+def execute_overall_skill_ranking(question: str, structured: bool = False) -> str | dict:
+    """Rank students by distinct cleared course-level records, not repeated attempts."""
+    limit_match = re.search(r"\btop\s+(\d+)\b", question, re.I)
+    limit = min(int(limit_match.group(1)), 100) if limit_match else 10
+    sql = validate_sql(
+        "SELECT roll_number, MIN(name) AS name, "
+        "COUNT(DISTINCT (LOWER(BTRIM(course_name)), course_level)) AS skills_cleared "
+        "FROM ps_student_course_summary WHERE cleared IS TRUE "
+        "GROUP BY roll_number ORDER BY skills_cleared DESC, name LIMIT " + str(limit)
+    )
+    columns, rows = fetch_rows(sql)
+    result = [
+        dict(zip(columns, [str(value) if value is not None else None for value in row]))
+        for row in rows
+    ]
+    answer = (
+        f"Top {limit} students overall, ranked by distinct cleared course-level records "
+        "(repeated attempts count once; the database has no separate skill field)."
+    ) if result else "No cleared course-level records were found."
+    return {"answer": answer, "columns": columns, "rows": result} if structured else answer
 
 def generate_sql(
     question: str, schema: list[dict], candidates: list[dict], correction: str = "",
@@ -372,9 +422,24 @@ def answer_question(
             return execute_and_answer(plan["original_question"], structured, plan)
         USER_SESSIONS.pop(sender, None)
 
+    if (
+        re.search(r"\bcourses?\b", clean, re.I)
+        and re.search(r"\b(how many|number|count|total)\b", clean, re.I)
+        and re.search(r"\b(available|availability|database|db|total)\b", clean, re.I)
+    ):
+        return execute_course_catalog_count(structured)
+
     broad_question = bool(re.search(
         r"\b(overall|across all courses|in all courses|all courses|every course)\b", clean, re.I
     )) and not bool(re.search(r"\b(?:in|for|named|called)\s+[a-z0-9]", clean, re.I))
+    if (
+        broad_question
+        and re.search(r"\b(top|rank|ranking|ranked|most)\b", clean, re.I)
+        and re.search(r"\bskills?\b", clean, re.I)
+        and re.search(r"\b(cleared|passed)\b", clean, re.I)
+    ):
+        return execute_overall_skill_ranking(clean, structured)
+
     candidates = semantic_candidates(clean) if not broad_question else []
     catalog = add_domain_mappings(relevant_catalog(clean, candidates)) if not broad_question else []
     if catalog:
