@@ -15,7 +15,11 @@ app = FastAPI(title="Student Skills WhatsApp Query Bot")
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+if MODEL == "llama-3.3-70b-versatile":
+    # Groq decommissioned this model ID in August 2026. Remap stale deployment
+    # settings so existing GROQ_MODEL environment variables do not break queries.
+    MODEL = "openai/gpt-oss-20b"
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
