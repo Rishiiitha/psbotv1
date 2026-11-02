@@ -3,7 +3,7 @@
 This starter imports the supplied MySQL-style `ps_cleared_course_view` dump into PostgreSQL, answers natural-language questions with Groq-generated **read-only SQL**, and sends replies through the official WhatsApp Cloud API.
 
 ## Important data limitation
-The source has these fields only: `roll_number`, `name`, `vertical_name`, `course_name`, `date`, `start_time`, `end_time`, `venue_name`, `status`. It has no explicit `skill`, `department`, GPA, or placement outcome columns. Questions such as "full stack" and "backend with Java" can only be approximated by matching course/vertical names unless you add a verified skill taxonomy. Also, each row is an assessment attempt; repeated rows are not necessarily separate students or unique skills.
+The imported source has these fields only: `roll_number`, `name`, `vertical_name`, `course_name`, `date`, `start_time`, `end_time`, `venue_name`, `status`. It has no explicit `skill`, `department`, GPA, or placement outcome columns. The derived `ps_cleared_course_view_cleaned` table stores normalized course names with a separate `course_level` (titles with no level use `Level 1`). The bot queries `ps_student_course_summary`, with one row per student, vertical, course, and level plus an `attempt_count` and a boolean `cleared` value.
 
 ## 1. Install PostgreSQL and pgAdmin
 Install PostgreSQL for Windows (include Command Line Tools) and pgAdmin 4. Remember: pgAdmin's **master password** unlocks saved server passwords; it is not the PostgreSQL database user's password.
@@ -26,7 +26,7 @@ Open `schema.sql` in pgAdmin Query Tool and execute it. Then create a dedicated 
 CREATE ROLE skillbot_readonly LOGIN PASSWORD 'REPLACE_WITH_A_LONG_RANDOM_PASSWORD';
 GRANT CONNECT ON DATABASE skillsdb TO skillbot_readonly;
 GRANT USAGE ON SCHEMA public TO skillbot_readonly;
-GRANT SELECT ON ps_cleared_course_view, course_embeddings TO skillbot_readonly;
+GRANT SELECT ON ps_student_course_summary, course_embeddings, ps_course_domain_map TO skillbot_readonly;
 ```
 
 Use a separate admin connection for importing. In PowerShell, from this project directory:
@@ -53,16 +53,24 @@ SELECT status, COUNT(*) FROM ps_cleared_course_view GROUP BY status;
 SELECT * FROM ps_cleared_course_view LIMIT 5;
 ```
 
-After importing, change `.env` back to the `skillbot_readonly` connection string.
+After importing, prepare the derived analysis tables from the imported attempts, then change `.env` back to the `skillbot_readonly` connection string. On the current database, `migrate_course_levels.sql` has already normalized course titles and added `course_level` to the cleaned attempts, student summary, domain mapping, and embedding tables. It is a one-time migration for that existing database; do not rerun it. For a fresh database, create/populate the cleaned attempts and student summary first, then use the same level extraction logic before loading domain mappings or embeddings.
 
-## 4. Optional semantic index with pgvector
-The bot uses SQL for exact counts/rankings; embeddings are helpful for finding related course names, not for counting students. Run:
+## 4. Semantic course understanding with pgvector
+Question answering now inspects the live PostgreSQL columns, retrieves related course/vertical names from pgvector, asks Groq to plan a read-only query from that context, and summarizes only the SQL result. Counts and rankings always come from SQL; embedding similarity is only used to find likely names. Overall questions do not need a course-name match.
+
+When a title such as `DataScience` has both an exact course and related subcourses, the assistant asks whether to use that exact course or the wider domain. For a domain such as `backend` with no exact course title, it matches relevant titles from the database catalog and ranks students by the summed inferred course difficulty, then by the number of distinct related courses cleared. Difficulty is inferred from course/level names because the source table has no difficulty field; answers label it as inferred.
+
+Course-to-domain assignments are stored in `ps_course_domain_map` and are read by the question planner. The mapping supports overlapping domains, includes a confidence and rationale, and leaves `reviewed=false` until an owner approves each assignment. The current seed includes IT subdomains, a broad `IT` label, a composite `Full Stack Development` mapping, and catalog-marked core courses. After preparing `ps_cleared_course_view_cleaned` and extracting course levels, mappings can be created or refreshed with `psql "postgresql://USER:PASSWORD@HOST:PORT/DATABASE" -f seed_course_domains.sql`. Grant the bot role `SELECT` access to this table as shown above.
+
+`sentence-transformers` is included in `requirements.txt`. On the first local run, it downloads `all-MiniLM-L6-v2` (internet access and additional disk space are needed for the Python/model dependencies). Set `ENABLE_SEMANTIC_SEARCH=false` to skip vector retrieval temporarily; direct schema-aware SQL planning still works. To build or refresh the course index after importing data, temporarily set `DATABASE_URL` to a database role that can insert/update `course_embeddings`, then run:
 
 ```powershell
 python embed_index.py
 ```
 
-The first run downloads `all-MiniLM-L6-v2` (internet required). This creates embeddings for distinct vertical/course names. To query nearest matches in pgAdmin:
+Restore the read-only bot `DATABASE_URL` after indexing. The deployed bot only needs `SELECT` access to both tables.
+
+This creates embeddings for distinct vertical/course names and the HNSW cosine index is declared in `schema.sql`. To query nearest matches in pgAdmin:
 
 ```sql
 SELECT vertical_name, course_name, 1 - (embedding <=> (
@@ -75,7 +83,7 @@ ORDER BY embedding <=> (
 LIMIT 10;
 ```
 
-That is only a wiring test; replace the subquery with a parameterized embedding generated from the user's query for actual semantic retrieval. The initial bot uses Groq + guarded SQL and does not yet use vector similarity in its answer path.
+The web and WhatsApp question path uses parameterized query embeddings to retrieve the eight nearest course/vertical pairs as planner context. If the extension/table/index or embedding package is unavailable, the service logs that semantic retrieval is unavailable and continues with schema-aware SQL planning.
 
 ## 5. Get Groq API key
 Create an API key in the Groq console and put it in `.env` as `GROQ_API_KEY`. Do not commit `.env` or expose the key in browser/client code. You can change `GROQ_MODEL` to a model currently available to your Groq account.

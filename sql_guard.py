@@ -1,12 +1,18 @@
 import re
 
 ALLOWED_COLUMNS = {
-    "roll_number", "name", "vertical_name", "course_name",
-    "date", "start_time", "end_time", "venue_name", "status"
+    "roll_number", "name", "vertical_name", "course_name", "course_level",
+    "date", "start_time", "end_time", "venue_name", "status", "attempt_count",
+    "cleared", "first_attempt_date", "last_attempt_date"
+}
+ALLOWED_SOURCES = {
+    "ps_cleared_course_view",
+    "ps_cleared_course_view_cleaned",
+    "ps_student_course_summary",
 }
 FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|"
-    r"copy|call|execute|do|merge|refresh|vacuum|analyze|set|reset|"
+    r"copy|call|execute|do|merge|refresh|vacuum|analyze|set|reset|join|union|intersect|except|"
     r"pg_sleep|information_schema|pg_catalog)\b", re.I
 )
 
@@ -33,8 +39,9 @@ def validate_sql(sql: str) -> str:
     # 4. Security checks
     if FORBIDDEN.search(sql):
         raise ValueError("Query contains a forbidden operation or system catalog.")
-    if not re.search(r"\bps_cleared_course_view\b", sql, re.I):
-        raise ValueError("Query must use the approved dataset.")
+    sources = re.findall(r"\bfrom\s+([a-zA-Z_][\w.]*)", sql, re.I)
+    if not sources or any(source.lower() not in ALLOWED_SOURCES for source in sources):
+        raise ValueError("Query must read only from the approved dataset.")
     
     # 5. Ensure safe row LIMIT
     if not re.search(r"\blimit\s+\d+\b", sql, re.I):

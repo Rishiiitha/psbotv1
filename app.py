@@ -21,456 +21,371 @@ WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 PHONE_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v22.0")
 
-# Session store to track multi-step options per user
-USER_SESSIONS = {}
-
-STOP_WORDS = {
-    "how", "many", "distinct", "students", "student", "cleared", "clear", "passed", "pass",
-    "have", "has", "count", "number", "of", "who", "show", "total", "list", "the", "for",
-    "in", "what", "is", "are", "which", "give", "me", "tell", "get", "result", "results",
-    "course", "courses", "vertical", "verticals", "attempt", "attempts",
-    "top", "first", "latest", "most"
-}
-
-SCHEMA = """
-Approved PostgreSQL table: ps_cleared_course_view
-Columns:
-roll_number VARCHAR, name VARCHAR, vertical_name VARCHAR, course_name VARCHAR,
-date DATE, start_time TIME, end_time TIME, venue_name VARCHAR, status VARCHAR.
-
-QUERYING RULES:
-1. Each row represents an assessment/course attempt.
-2. Use COUNT(DISTINCT roll_number) for student counts.
-3. Use COUNT(*) only for record/attempt counts.
-4. Always filter status ILIKE 'Cleared' when user asks for cleared/passed students.
-5. Only SELECT queries. Always include LIMIT <= 100 for row results.
+TABLE = "ps_student_course_summary"
+STATIC_SCHEMA = """
+Each row is one student, vertical, course, and course_level. attempt_count stores repeated attempts.
+For student counts use COUNT(DISTINCT roll_number); for attempts use SUM(attempt_count).
+The cleared column is boolean. Use cleared IS TRUE for cleared/passed and cleared IS FALSE otherwise.
+course_level is a separate canonical value such as Level 1, Level 1A, Level 2.0; titles without a level default to Level 1.
+For level counts count distinct (course_name, course_level), not attempts.
+An overall question without a course/vertical filter applies across all rows.
+The source has no department, skill, GPA, or placement columns. Never invent them.
+Use only the approved table and discovered columns. Return one read-only SELECT.
+Use LIMIT <= 100 for row lists.
 """
 
-def normalize_str(text: str) -> str:
-    """Removes non-alphanumeric characters and converts to lowercase for comparisons."""
-    return re.sub(r'[^a-zA-Z0-9]', '', str(text)).lower()
+_schema_cache = None
+_embedding_model = None
+_vector_index_ready = None
+USER_SESSIONS = {}
 
-def stem_term(term: str) -> str:
-    """Strips plural suffixes ('s' or 'es') so singular/plural search terms match."""
-    t = term.strip()
-    if t.lower().endswith('es') and len(t) > 4:
-        return t[:-2]
-    if t.lower().endswith('s') and len(t) > 3 and not t.lower().endswith('ss'):
-        return t[:-1]
-    return t
-
-def extract_entity_phrases(question: str) -> list[str]:
-    """Extracts complete database entity phrases, preserving AND/OR groups."""
-    prompt = (
-        "Extract every distinct database entity phrase requested by the user as "
-        "a JSON array. Preserve words, punctuation, and numeric designations "
-        "that belong together. Separate entities joined by conjunctions. Do not "
-        "invent or normalize entity names. Return JSON only.\n"
-        f"Question: {question}"
-    )
-    try:
-        response = groq_client.chat.completions.create(
-            model=MODEL,
-            temperature=0,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
+def database_schema() -> list[dict]:
+    """Inspect live PostgreSQL columns so SQL generation follows the deployed schema."""
+    global _schema_cache
+    if _schema_cache is None:
+        _, rows = fetch_rows(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s ORDER BY ordinal_position",
+            (TABLE,),
         )
-        match = re.search(r"\[.*\]", response.choices[0].message.content or "", re.DOTALL)
-        phrases = json.loads(match.group(0)) if match else []
-        if isinstance(phrases, list):
-            cleaned = split_entity_phrases(phrases)
-            if cleaned:
-                return list(dict.fromkeys(cleaned))
-    except Exception as error:
-        print(f"Entity extraction failed: {type(error).__name__}: {error}")
-
-    question = re.sub(
-        r"\b(how many|count|number of|distinct|students?|who|cleared|passed|"
-        r"show|list|what is|what are|give me|tell me|the|all)\b",
-        " ",
-        question,
-        flags=re.I,
-    )
-    phrases = re.split(r"\s+(?:and|or)\s+", question, flags=re.I)
-    return [
-        phrase
-        for phrase in split_entity_phrases(phrases)
-        if phrase
-    ]
-
-def split_entity_phrases(phrases: list) -> list[str]:
-    """Splits conjunction-joined entities returned by the extractor."""
-    result = []
-    for phrase in phrases:
-        parts = re.split(r"\s+(?:and|or)\s+", str(phrase), flags=re.I)
-        result.extend(clean_entity_phrase(part) for part in parts)
-    return [phrase for phrase in result if phrase]
-
-def clean_entity_phrase(phrase: str) -> str:
-    """Removes generic query language while preserving entity words and levels."""
-    cleaned = re.sub(r"\s+", " ", phrase).strip(" ?,.")
-    cleaned = re.sub(r"^(?:top|first|latest|most)\s+\d+\s+", "", cleaned, flags=re.I)
-    while True:
-        updated = re.sub(
-            r"^(?:(?:top|first|latest|most)\s+\d+|how|many|distinct|student|students|cleared|clear|passed|pass|"
-            r"have|has|count|number|of|who|show|total|list|the|for|in|what|is|"
-            r"are|which|give|me|tell|get|result|results|course|courses|vertical|"
-            r"verticals|attempt|attempts|top|first|latest|most)\s+",
-            "",
-            cleaned,
-            flags=re.I,
-        )
-        if updated == cleaned:
-            return cleaned
-        cleaned = updated
-
-def resolve_vertical_or_course(question: str) -> dict:
-    """Resolves every requested entity independently before SQL generation."""
-    phrases = extract_entity_phrases(question)
-    if not phrases:
-        return {"status": "proceed", "resolved_term": None}
-
-    resolved = []
-    unresolved = []
-    ambiguous_groups = []
-    for phrase in phrases:
-        terms = [
-            normalize_str(stem_term(term))
-            for term in re.findall(r"[a-zA-Z0-9]+", phrase)
-            if term.lower() not in STOP_WORDS
-        ]
-        if not terms:
-            continue
-        conditions = " AND ".join(
-            "(regexp_replace(LOWER(vertical_name), '[^a-z0-9]', '', 'g') LIKE %s "
-            "OR regexp_replace(LOWER(course_name), '[^a-z0-9]', '', 'g') LIKE %s)"
-            for _ in terms
-        )
-        params = [value for term in terms for value in (f"%{term}%", f"%{term}%")]
-        try:
-            _, rows = fetch_rows(
-                f"SELECT DISTINCT vertical_name, course_name FROM ps_cleared_course_view "
-                f"WHERE {conditions} LIMIT 100",
-                tuple(params),
-            )
-        except Exception as error:
-            print(f"Entity lookup failed: {type(error).__name__}: {error}")
-            rows = []
-        matches = sorted({
-            value for vertical, course in rows
-            for value in (vertical, course)
-            if value and all(term in normalize_str(value) for term in terms)
-        })
-        if len(matches) == 1:
-            resolved.append(matches[0])
-        elif len(matches) > 1:
-            ambiguous_groups.append(matches)
-        else:
-            unresolved.append(phrase)
-
-    if ambiguous_groups:
-        return {
-            "status": "ambiguous",
-            "options": ambiguous_groups[0],
-            "pending_options": ambiguous_groups[1:],
-            "resolved_entities": resolved,
-        }
-    if unresolved:
-        return {"status": "unresolved", "phrases": unresolved}
-    return {"status": "proceed", "resolved_term": resolved}
-
-def get_sub_levels(entity_name: str) -> list[str]:
-    """Queries DB to find all distinct course levels or sub-courses under a topic."""
-    sql = """
-        SELECT DISTINCT course_name
-        FROM ps_cleared_course_view
-        WHERE vertical_name ILIKE %s OR course_name ILIKE %s
-        ORDER BY course_name;
-    """
-    param = f"%{entity_name}%"
-    try:
-        cols, rows = fetch_rows(sql, (param, param))
         if not rows:
+            raise RuntimeError(f"Database table {TABLE} was not found or has no visible columns.")
+        _schema_cache = [{"name": row[0], "type": row[1]} for row in rows]
+    return _schema_cache
+
+def semantic_candidates(question: str) -> list[dict]:
+    """Retrieve likely course/vertical matches with pgvector; SQL remains the source of counts."""
+    global _embedding_model, _vector_index_ready
+    if os.getenv("ENABLE_SEMANTIC_SEARCH", "true").lower() not in {"1", "true", "yes"}:
+        return []
+    try:
+        if _vector_index_ready is None:
+            _, status = fetch_rows("SELECT EXISTS (SELECT 1 FROM course_embeddings LIMIT 1)")
+            _vector_index_ready = bool(status and status[0][0])
+        if not _vector_index_ready:
             return []
-        return sorted(list({r[0] for r in rows if r[0]}))
-    except Exception as e:
-        print(f"Error fetching sub-levels: {e}")
+        if _embedding_model is None:
+            from sentence_transformers import SentenceTransformer
+            _embedding_model = SentenceTransformer(os.getenv(
+                "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            ))
+        vector = _embedding_model.encode(question, normalize_embeddings=True)
+        vector_text = "[" + ",".join(f"{float(value):.8f}" for value in vector) + "]"
+        _, rows = fetch_rows(
+            "SELECT vertical_name, course_name, course_level, "
+            "1 - (embedding <=> %s::vector) AS similarity "
+            "FROM course_embeddings ORDER BY embedding <=> %s::vector LIMIT 40",
+            (vector_text, vector_text),
+        )
+        return [
+            {"vertical": row[0], "course": row[1], "course_level": row[2], "similarity": round(float(row[3]), 3)}
+            for row in rows
+        ]
+    except Exception as error:
+        # The system can still plan exact SQL when vector extension/index/model is not installed.
+        _vector_index_ready = False
+        print(f"Semantic retrieval unavailable: {type(error).__name__}: {error}")
         return []
 
-def format_selection_message(message: str, options: list[str]) -> str:
-    lines = [message, "", "Please select an option:"]
-    lines.extend(f"*{idx}* - {option}" for idx, option in enumerate(options, 1))
-    return "\n".join(lines)
+def relevant_catalog(question: str, semantic: list[dict]) -> list[dict]:
+    """Combine literal database matches with semantic neighbors for exact/domain decisions."""
+    stop = {"top", "show", "list", "find", "who", "students", "student", "in", "for", "the",
+            "with", "most", "many", "count", "cleared", "passed", "course", "courses", "domain",
+            "overall", "best", "ranked", "rank", "of", "across", "all", "their", "has", "have"}
+    catalog_question = re.sub(r"\btop\s+\d+\b", " ", question, flags=re.I)
+    terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9]+", catalog_question) if term.lower() not in stop]
+    found = {}
+    if terms:
+        conditions, params = [], []
+        for term in terms:
+            compact = re.sub(r"[^a-z0-9]", "", term)
+            conditions.append(
+                "(regexp_replace(LOWER(vertical_name), '[^a-z0-9]', '', 'g') LIKE %s "
+                "OR regexp_replace(LOWER(course_name), '[^a-z0-9]', '', 'g') LIKE %s "
+                "OR regexp_replace(LOWER(course_level), '[^a-z0-9]', '', 'g') LIKE %s)"
+            )
+            params.extend([f"%{compact}%", f"%{compact}%", f"%{compact}%"])
+        try:
+            _, rows = fetch_rows(
+                "SELECT DISTINCT vertical_name, course_name, course_level FROM ps_student_course_summary WHERE "
+                + " AND ".join(conditions) + " ORDER BY vertical_name, course_name, course_level LIMIT 100",
+                tuple(params),
+            )
+            for vertical, course, level in rows:
+                found[(vertical, course, level)] = {
+                    "vertical": vertical, "course": course, "course_level": level, "source": "literal"
+                }
+        except Exception as error:
+            print(f"Literal catalog search failed: {type(error).__name__}: {error}")
+    if not semantic and not found:
+        try:
+            _, rows = fetch_rows(
+                "SELECT DISTINCT vertical_name, course_name, course_level FROM ps_student_course_summary "
+                "ORDER BY vertical_name, course_name, course_level"
+            )
+            for vertical, course, level in rows:
+                found[(vertical, course, level)] = {
+                    "vertical": vertical, "course": course, "course_level": level, "source": "full_catalog"
+                }
+        except Exception as error:
+            print(f"Full catalog lookup failed: {type(error).__name__}: {error}")
+    for item in semantic:
+        key = (item.get("vertical"), item.get("course"), item.get("course_level", "Level 1"))
+        found.setdefault(key, {**item, "source": "semantic"})
+    return list(found.values())
 
-def execute_multi_entity_query(
-    question: str, entities: list[str], structured: bool = False
-) -> str | dict:
-    entity_filter = " OR ".join(
-        "(vertical_name ILIKE %s OR course_name ILIKE %s)" for _ in entities
-    )
-    entity_count = "COUNT(DISTINCT CASE " + " ".join(
-        "WHEN (vertical_name ILIKE %s OR course_name ILIKE %s) THEN %s"
-        for _ in entities
-    ) + " END)"
-    filter_params = [
-        value for entity in entities
-        for value in (f"%{entity}%", f"%{entity}%")
-    ]
-    count_params = [
-        value
-        for entity in entities
-        for value in (f"%{entity}%", f"%{entity}%", entity)
-    ]
-    asks_for_count = bool(re.search(
-        r"\b(count|counts|how many|number of|total)\b", question, re.I
-    ))
-    wants_rows = not asks_for_count and bool(re.search(
-        r"\b(who|list|show|top|which)\b", question, re.I
-    ))
-    if wants_rows:
-        sql = f"""
-            SELECT roll_number, name, {entity_count} AS matched_entities
-            FROM ps_cleared_course_view
-            WHERE status ILIKE 'Cleared' AND ({entity_filter})
-            GROUP BY roll_number, name
-            HAVING {entity_count} = {len(entities)}
-            ORDER BY matched_entities DESC, name
-            LIMIT 100
-        """
-        params = count_params + filter_params + count_params
-    else:
-        sql = f"""
-            SELECT COUNT(*) AS student_count
-            FROM (
-                SELECT roll_number
-                FROM ps_cleared_course_view
-                WHERE status ILIKE 'Cleared' AND ({entity_filter})
-                GROUP BY roll_number
-                HAVING {entity_count} = {len(entities)}
-            ) matched_students
-        """
-        params = filter_params + count_params
-    cols, rows = fetch_rows(sql, tuple(params))
-    result = [dict(zip(cols, [str(value) if value is not None else None for value in row])) for row in rows]
-    if not result:
-        answer = "No students matched all selected entities."
-        return {"answer": answer, "columns": [], "rows": []} if structured else answer
+def add_domain_mappings(catalog: list[dict]) -> list[dict]:
+    """Attach the curated database taxonomy to the matching live course pairs."""
+    try:
+        _, rows = fetch_rows(
+            "SELECT vertical_name, course_name, course_level, domain_name, confidence, reviewed "
+            "FROM ps_course_domain_map ORDER BY domain_name, course_name, course_level"
+        )
+    except Exception as error:
+        print(f"Course-domain mapping lookup unavailable: {type(error).__name__}: {error}")
+        return catalog
+    by_pair = {(item.get("vertical"), item.get("course"), item.get("course_level", "Level 1")): item for item in catalog}
+    for vertical, course, level, domain, confidence, reviewed in rows:
+        key = (vertical, course, level)
+        item = by_pair.get(key)
+        if item is None:
+            item = {"vertical": vertical, "course": course, "course_level": level,
+                    "source": "domain_map", "domains": []}
+            catalog.append(item)
+            by_pair[key] = item
+        item.setdefault("domains", []).append({
+            "name": domain, "confidence": float(confidence), "reviewed": bool(reviewed)
+        })
+    return catalog
+
+def interpret_scope(question: str, catalog: list[dict]) -> dict:
+    """Decide whether the user means one course or a domain made of related courses."""
     response = groq_client.chat.completions.create(
-        model=MODEL,
-        temperature=0.2,
-        max_tokens=300,
+        model=MODEL, temperature=0, max_tokens=1000,
         messages=[
             {"role": "system", "content":
-             "Answer using only the supplied database result. Return exactly two short lines. "
-             "Bold the key result on line one and describe the selected entities on line two."},
-            {"role": "user", "content": f"Question: {question}\nResult: {json.dumps(result)}"},
+             "Interpret the requested course/domain scope using only the supplied real database catalog. "
+             "Return JSON only with keys mode, exact_pair, matched_domain, domain_pairs, difficulty_order, difficulty_basis. "
+             "mode must be exact, domain, clarify, or unknown. exact_pair is one exact {vertical, course, course_level} entry or null. "
+             "domain_pairs is a list of exact {vertical, course, course_level} entries from catalog and should include "
+             "all relevant courses for the named domain (not unrelated nearest neighbors). If an exact "
+             "course title also has related subcourses and the user did not clearly say exact course or "
+             "whole domain, choose clarify. If the user says domain/overall/all related, choose domain. "
+             "If a term such as backend has no exact course but has a matching mapped domain, choose domain "
+             "and return that exact domain label as matched_domain. Mapped domain associations are included "
+             "on catalog entries; prefer those mappings over inventing a new course set. Unreviewed mappings "
+             "are inferred and should not be described as verified. For a general full-stack request, use "
+             "the mapped 'Full Stack Development' domain, which combines mapped frontend and backend/database "
+             "courses, instead of the narrower title-only 'Full Stack & DevOps' mapping. "
+             "difficulty_order lists relevant entries from easiest to hardest using the explicit course_level "
+             "column where possible; titles alone are not authoritative. When ordering is unclear, preserve "
+             "catalog order and label it inferred. Never invent catalog entries."},
+            {"role": "user", "content":
+             f"Question: {question}\nCatalog: {json.dumps(catalog, ensure_ascii=False)}"},
         ],
     )
-    answer = response.choices[0].message.content or str(result)
+    text = response.choices[0].message.content or "{}"
+    match = re.search(r"\{.*\}", text, re.S)
+    try:
+        plan = json.loads(match.group(0)) if match else {}
+    except json.JSONDecodeError:
+        return {"mode": "unknown"}
+    if not isinstance(plan, dict):
+        return {"mode": "unknown"}
+    if not isinstance(plan.get("mode"), str) or plan["mode"] not in {"exact", "domain", "clarify", "unknown"}:
+        plan["mode"] = "unknown"
+    allowed = {(str(item.get("vertical")), str(item.get("course")), str(item.get("course_level", "Level 1")))
+               for item in catalog}
+    def valid_pairs(values):
+        output = []
+        for pair in values if isinstance(values, list) else []:
+            if isinstance(pair, dict):
+                key = (str(pair.get("vertical")), str(pair.get("course")), str(pair.get("course_level", "Level 1")))
+                if key in allowed and key not in {
+                    (x["vertical"], x["course"], x["course_level"]) for x in output
+                }:
+                    output.append({"vertical": key[0], "course": key[1], "course_level": key[2]})
+        return output
+    plan["exact_pair"] = valid_pairs([plan.get("exact_pair")])[0] if plan.get("exact_pair") else None
+    plan["domain_pairs"] = valid_pairs(plan.get("domain_pairs"))
+    plan["difficulty_order"] = valid_pairs(plan.get("difficulty_order"))
+    domain_names = {
+        domain.get("name")
+        for item in catalog for domain in item.get("domains", [])
+        if isinstance(domain, dict) and domain.get("name")
+    }
+    matched_domain = plan.get("matched_domain")
+    plan["matched_domain"] = next((
+        domain for domain in domain_names
+        if isinstance(matched_domain, str) and domain.casefold() == matched_domain.strip().casefold()
+    ), None)
+    if plan["mode"] == "domain" and plan["matched_domain"]:
+        plan["domain_pairs"] = [
+            {"vertical": item["vertical"], "course": item["course"], "course_level": item["course_level"]}
+            for item in catalog
+            if any(domain.get("name") == plan["matched_domain"] for domain in item.get("domains", []))
+        ]
+    if plan["mode"] == "clarify" and (not plan["exact_pair"] or len(plan["domain_pairs"]) < 2):
+        plan["mode"] = "unknown"
+    return plan
+
+def clarification_text(plan: dict) -> str:
+    exact = f"{plan['exact_pair']['course']} ({plan['exact_pair']['course_level']})"
+    domain_courses = ", ".join(dict.fromkeys(
+        f"{item['course']} ({item['course_level']})" for item in plan["domain_pairs"]
+    ))
+    return (
+        f'I found both the exact course "{exact}" and related courses. Which scope should I use?\n\n'
+        f"*1* - Only the exact course: {exact}\n"
+        f"*2* - The wider domain: {domain_courses}"
+    )
+
+def execute_domain_ranking(question: str, plan: dict, structured: bool = False) -> str | dict:
+    pairs = plan.get("domain_pairs", [])
+    if not pairs:
+        answer = "I couldn't find related courses for that domain in the course catalog."
+        return {"answer": answer, "columns": [], "rows": []} if structured else answer
+    where = " OR ".join(
+        "(BTRIM(vertical_name) = %s AND BTRIM(course_name) = %s AND course_level = %s)"
+        for _ in pairs
+    )
+    pair_params = [value for pair in pairs for value in
+                   (pair["vertical"], pair["course"], pair["course_level"])]
+    level_score = "(COALESCE((regexp_match(course_level, '(?i)^Level\\s*([0-9]+(?:\\.[0-9]+)?)([A-Z]?)$'))[1]::NUMERIC, 1) * 100 + CASE WHEN COALESCE((regexp_match(course_level, '(?i)^Level\\s*[0-9]+(?:\\.[0-9]+)?([A-Z]?)$'))[1], '') = '' THEN 0 ELSE ASCII(UPPER((regexp_match(course_level, '(?i)^Level\\s*[0-9]+(?:\\.[0-9]+)?([A-Z]?)$'))[1])) - 64 END)"
+    limit_match = re.search(r"\btop\s+(\d+)\b", question, re.I)
+    limit = min(int(limit_match.group(1)), 100) if limit_match else 10
+    sql = (
+        "SELECT roll_number, name, COUNT(DISTINCT (LOWER(BTRIM(course_name)), course_level)) AS levels_cleared, "
+        f"SUM({level_score}) AS difficulty_score, MAX({level_score}) AS highest_level_score, "
+        "STRING_AGG(DISTINCT BTRIM(course_name) || ' (' || course_level || ')', ', ' "
+        "ORDER BY BTRIM(course_name) || ' (' || course_level || ')') AS cleared_courses "
+        "FROM ps_student_course_summary WHERE cleared IS TRUE AND (" + where + ") "
+        "GROUP BY roll_number, name ORDER BY difficulty_score DESC, levels_cleared DESC, "
+        "highest_level_score DESC, name "
+        f"LIMIT {limit}"
+    )
+    sql = validate_sql(sql)
+    cols, rows = fetch_rows(sql, tuple(pair_params))
+    result = [dict(zip(cols, [str(value) if value is not None else None for value in row])) for row in rows]
+    answer = (
+        f"Top {limit} domain students, ranked by summed numeric course levels, then number of distinct levels cleared. "
+        "The level labels are taken from course names; difficulty itself is not a stored field."
+    ) if result else "No students have cleared courses matched to this domain."
     return {"answer": answer, "columns": cols, "rows": result} if structured else answer
 
-def generate_sql(question: str, resolved_entity: str | list[str] = None) -> str:
-    """Generates PostgreSQL query using the exact resolved vertical or course name."""
-    if resolved_entity:
-        entities = [resolved_entity] if isinstance(resolved_entity, str) else resolved_entity
-        entity_text = json.dumps(entities, ensure_ascii=False)
-        system_content = (
-            "You are a PostgreSQL expert. Output ONLY the executable raw SQL query with no explanation or markdown fences.\n"
-            f"The complete database entity targets are EXACTLY: {entity_text}.\n"
-            "Every target must be included in the query. IMPORTANT: one assessment "
-            "row cannot match two different entities. When there are multiple "
-            "targets, first filter rows with status ILIKE 'Cleared' and one OR "
-            "condition per target, then GROUP BY roll_number and name and use "
-            "HAVING COUNT(DISTINCT CASE WHEN entity_condition_1 THEN 'entity_1' "
-            "WHEN entity_condition_2 THEN 'entity_2' END) equal to "
-            f"{len(entities)}. This finds students who cleared every target across separate "
-            "rows. Never put different entity conditions in an AND clause on the "
-            "same row. Do not use abbreviated wording or add entities not in the "
-            "target list. Keep SQL to the approved table and columns.\n"
-            "Use COUNT(DISTINCT roll_number) for student counts.\n"
-            + SCHEMA
-        )
-    else:
-        system_content = (
-            "You are a PostgreSQL expert. Output ONLY the executable raw SQL query with no explanation or markdown fences.\n"
-            "Split all search keywords into separate ILIKE conditions joined with AND.\n"
-            + SCHEMA
-        )
-
+def generate_sql(
+    question: str, schema: list[dict], candidates: list[dict], correction: str = "",
+    scope_plan: dict | None = None,
+) -> str:
+    context = json.dumps({
+        "columns": schema,
+        "related_course_candidates": candidates,
+        "selected_scope": scope_plan,
+    }, ensure_ascii=False)
+    system_content = (
+        "Translate questions about student course records into PostgreSQL. Use the supplied live schema "
+        "and semantic candidates to understand the request; candidates are hints, not answer data. "
+        "When selected_scope is exact, filter to its exact vertical/course pair. When selected_scope is domain, "
+        "include only its listed domain_pairs; do not broaden the course set. "
+        "Do not require a course name for an overall question. A skill is not a source column, but when "
+        "selected_scope supplies database-matched domain_pairs, use those exact pairs as the domain's "
+        "course mapping. A department without mapped values cannot be assumed. For student counts use "
+        "COUNT(DISTINCT roll_number). "
+        "For rankings group by requested student identity and order by the requested metric. "
+        "Output only one executable SELECT statement. Do not use joins, other tables, system catalogs, "
+        "side effects, or writes. Use only the approved table and live columns. Limit row lists to 100.\n\n"
+        + STATIC_SCHEMA
+    )
     response = groq_client.chat.completions.create(
-        model=MODEL,
-        temperature=0,
-        max_tokens=700,
+        model=MODEL, temperature=0, max_tokens=900,
         messages=[
             {"role": "system", "content": system_content},
-            {"role": "user", "content": question}
+            {"role": "user", "content":
+             f"Live database context: {context}\n\nQuestion: {question}"
+             + (f"\n\nYour previous SQL failed. Correct it using this PostgreSQL error: {correction}" if correction else "")},
         ],
     )
     return validate_sql(response.choices[0].message.content or "")
 
 def execute_and_answer(
-    question: str, resolved_entity: str | list[str] = None, structured: bool = False
+    question: str, structured: bool = False, scope_plan: dict | None = None
 ) -> str | dict:
-    """Helper function to execute SQL and format the answer from Groq."""
-    if isinstance(resolved_entity, list) and resolved_entity:
-        return execute_multi_entity_query(question, resolved_entity, structured)
-    sql = generate_sql(question, resolved_entity)
-    cols, rows = fetch_rows(sql)
-
+    if scope_plan and scope_plan.get("mode") == "domain" and re.search(
+        r"\b(top|rank|highest|best|most)\b", question, re.I
+    ):
+        return execute_domain_ranking(question, scope_plan, structured)
+    schema = database_schema()
+    candidates = semantic_candidates(question)
+    correction = ""
+    for attempt in range(2):
+        sql = generate_sql(question, schema, candidates, correction, scope_plan)
+        try:
+            cols, rows = fetch_rows(sql)
+            break
+        except Exception as error:
+            if attempt:
+                raise
+            correction = f"{type(error).__name__}: {error}"
     if not rows:
-        target_msg = f" for '{resolved_entity}'" if resolved_entity else ""
-        answer = f"No matching records found{target_msg}. Try rephrasing your search keywords."
+        answer = "No records matched that question in the available student course data."
         return {"answer": answer, "columns": [], "rows": []} if structured else answer
-
-    result = [dict(zip(cols, [str(v) if v is not None else None for v in row])) for row in rows]
-
+    result = [dict(zip(cols, [str(value) if value is not None else None for value in row])) for row in rows]
     response = groq_client.chat.completions.create(
-        model=MODEL, temperature=0.2, max_tokens=700,
+        model=MODEL, temperature=0.1, max_tokens=500,
         messages=[
             {"role": "system", "content":
-             "Answer using ONLY the database result supplied. Return exactly two lines. "
-             "Line 1 must be a short, crisp answer with the important result wrapped "
-             "in markdown bold. Line 2 must be one "
-             "short description explaining the matched course, vertical, or level. "
-             "Do not add headings, bullets, greetings, or extra explanation."},
+             "Answer using only the SQL result and supplied schema. Give the direct answer first, "
+             "include the unit/metric (students vs attempts), and be concise. If the requested concept "
+             "is absent from schema/results, say so and identify the closest available fields. "
+             "Never infer facts not present in the result."},
             {"role": "user", "content":
-             f"Question: {question}\nTarget Entity: {resolved_entity}\nSQL used: {sql}\nDatabase rows (JSON): {json.dumps(result, ensure_ascii=False)}"}
+             f"Question: {question}\nSchema: {json.dumps(schema)}\nSQL: {sql}\n"
+             f"Result: {json.dumps(result, ensure_ascii=False)}"},
         ],
     )
-    answer = response.choices[0].message.content or str(result)
-    if structured:
-        return {"answer": answer, "columns": cols, "rows": result}
-    return answer
+    answer = response.choices[0].message.content or json.dumps(result, ensure_ascii=False)
+    return {"answer": answer, "columns": cols, "rows": result} if structured else answer
 
-def answer_question(sender: str, question: str, structured: bool = False) -> str | dict:
-    global USER_SESSIONS
-    clean_text = question.strip()
-    norm_input = normalize_str(clean_text)
+def answer_question(
+    sender: str, question: str, structured: bool = False,
+    clarification_context: dict | None = None,
+) -> str | dict:
+    clean = question.strip()
+    pending = clarification_context if structured else USER_SESSIONS.get(sender)
+    if pending:
+        selected = None
+        if re.fullmatch(r"\s*(?:option\s*)?1\s*", clean, re.I) or clean.lower() in {"exact", "exact course", "course"}:
+            selected = "exact"
+        elif re.fullmatch(r"\s*(?:option\s*)?2\s*", clean, re.I) or clean.lower() in {"domain", "all related", "whole domain"}:
+            selected = "domain"
+        if selected:
+            USER_SESSIONS.pop(sender, None)
+            plan = dict(pending)
+            if selected == "exact":
+                plan.update({"mode": "exact", "domain_pairs": [plan["exact_pair"]]})
+            else:
+                plan["mode"] = "domain"
+            return execute_and_answer(plan["original_question"], structured, plan)
+        USER_SESSIONS.pop(sender, None)
 
-    # 1. PROCESS MULTI-STEP SESSION (Topic Selection -> Level Selection -> Execute)
-    if sender in USER_SESSIONS:
-        session = USER_SESSIONS[sender]
-        step = session.get("step", "SELECT_TOPIC")
-        options = session.get("options", [])
-        orig_question = session.get("original_question", question)
-
-        selected_option = None
-
-        # Check numeric selection (e.g., "1", "2")
-        num_match = re.search(r"^\s*(?:option\s*)?(\d+)\s*$", clean_text, re.I)
-        if num_match:
-            idx = int(num_match.group(1)) - 1
-            if 0 <= idx < len(options):
-                selected_option = options[idx]
-
-        # Check text matching selection
-        if not selected_option:
-            for opt in options:
-                if norm_input == normalize_str(opt):
-                    selected_option = opt
-                    break
-
-        if selected_option:
-            # STEP 1: TOPIC SELECTED -> CHECK FOR SUB-LEVELS
-            if step == "SELECT_TOPIC":
-                pending_options = session.get("pending_options", [])
-                if pending_options:
-                    USER_SESSIONS[sender] = {
-                        "step": "SELECT_TOPIC",
-                        "options": pending_options[0],
-                        "pending_options": pending_options[1:],
-                        "multi_entity": True,
-                        "resolved_entities": [
-                            *session.get("resolved_entities", []),
-                            selected_option,
-                        ],
-                        "original_question": orig_question,
-                    }
-                    return format_selection_message(
-                        "Now select the matching option for the next requested entity.",
-                        pending_options[0],
-                    )
-                if session.get("multi_entity"):
-                    del USER_SESSIONS[sender]
-                    targets = list(dict.fromkeys([
-                        *session.get("resolved_entities", []),
-                        selected_option,
-                    ]))
-                    return execute_and_answer(orig_question, targets, structured)
-
-                sub_courses = get_sub_levels(selected_option)
-
-                # Find sub-courses/levels distinct from the topic itself
-                distinct_levels = [
-                    c for c in sub_courses
-                    if normalize_str(c) != normalize_str(selected_option)
-                ]
-
-                if len(distinct_levels) >= 1:
-                    level_options = ["All Levels (Overall Count)"] + sub_courses
-                    level_options = list(dict.fromkeys(level_options))
-
-                    USER_SESSIONS[sender] = {
-                        "step": "SELECT_LEVEL",
-                        "selected_topic": selected_option,
-                        "options": level_options,
-                        "resolved_entities": session.get("resolved_entities", []),
-                        "original_question": orig_question
-                    }
-
-                    msg = f"Which level of *{selected_option}* are you referring to?\n\n"
-                    for idx, opt in enumerate(level_options, 1):
-                        msg += f"*{idx}* - {opt}\n"
-                    return msg
-
-                # No sub-levels exist -> execute query directly for selected topic
-                del USER_SESSIONS[sender]
-                entities = session.get("resolved_entities", [])
-                targets = list(dict.fromkeys([*entities, selected_option]))
-                return execute_and_answer(orig_question, targets, structured)
-
-            # STEP 2: LEVEL SELECTED -> EXECUTE FINAL QUERY
-            elif step == "SELECT_LEVEL":
-                selected_topic = session.get("selected_topic", selected_option)
-                del USER_SESSIONS[sender]
-
-                if "all levels" in selected_option.lower():
-                    selected_target = selected_topic
-                else:
-                    selected_target = selected_option
-                entities = session.get("resolved_entities", [])
-                targets = list(dict.fromkeys([*entities, selected_target]))
-                return execute_and_answer(orig_question, targets, structured)
-
-        del USER_SESSIONS[sender]
-
-    # 2. PROCESS NEW QUESTION
-    resolution = resolve_vertical_or_course(question)
-    
-    if resolution["status"] == "ambiguous":
-        options = resolution["options"]
-        USER_SESSIONS[sender] = {
-            "step": "SELECT_TOPIC",
-            "options": options,
-            "pending_options": resolution.get("pending_options", []),
-            "multi_entity": bool(resolution.get("pending_options")),
-            "resolved_entities": resolution.get("resolved_entities", []),
-            "original_question": question
-        }
-        
-        return format_selection_message(
-            "Multiple matching topics/verticals were found.",
-            options,
-        )
-
-    if resolution["status"] == "unresolved":
-        phrases = ", ".join(resolution["phrases"])
-        message = f"I could not uniquely match: {phrases}. Please provide the complete course or vertical name."
-        return {"answer": message, "columns": [], "rows": []} if structured else message
-
-    resolved_entity = resolution.get("resolved_term")
-    return execute_and_answer(question, resolved_entity, structured)
-
+    broad_question = bool(re.search(
+        r"\b(overall|across all courses|in all courses|all courses|every course)\b", clean, re.I
+    )) and not bool(re.search(r"\b(?:in|for|named|called)\s+[a-z0-9]", clean, re.I))
+    candidates = semantic_candidates(clean) if not broad_question else []
+    catalog = add_domain_mappings(relevant_catalog(clean, candidates)) if not broad_question else []
+    if catalog:
+        plan = interpret_scope(clean, catalog)
+        if plan.get("mode") == "clarify":
+            plan["original_question"] = clean
+            answer = clarification_text(plan)
+            if structured:
+                return {"answer": answer, "columns": [], "rows": [], "clarification": plan}
+            USER_SESSIONS[sender] = plan
+            return answer
+        if plan.get("mode") in {"exact", "domain"}:
+            plan["original_question"] = clean
+            return execute_and_answer(clean, structured, plan)
+    return execute_and_answer(clean, structured)
 async def send_whatsapp(to: str, body: str):
     if not (WA_TOKEN and PHONE_ID):
         raise RuntimeError("WhatsApp Cloud API credentials missing")
@@ -486,6 +401,7 @@ async def send_whatsapp(to: str, body: str):
 class QueryRequest(BaseModel):
     question: str
     session_id: str
+    clarification_context: dict | None = None
 
 
 @app.get("/")
@@ -495,7 +411,12 @@ def frontend():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "Student Skills WhatsApp Query Bot"}
+    try:
+        fetch_rows("SELECT 1")
+    except Exception as error:
+        print(f"Database health check failed: {type(error).__name__}: {error}")
+        raise HTTPException(status_code=503, detail="Database unavailable.") from error
+    return {"status": "ok", "database": "connected", "service": "Student Skills Query Bot"}
 
 
 @app.post("/api/query")
@@ -507,7 +428,10 @@ def query(request: QueryRequest):
     if not session_id:
         raise HTTPException(status_code=400, detail="Session ID is required.")
     try:
-        result = answer_question(session_id, question, structured=True)
+        result = answer_question(
+            session_id, question, structured=True,
+            clarification_context=request.clarification_context,
+        )
         if isinstance(result, dict):
             return result
         return {"answer": result, "columns": [], "rows": []}

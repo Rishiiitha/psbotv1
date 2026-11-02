@@ -6,9 +6,26 @@ const chat = document.querySelector("#chat");
 const charCount = document.querySelector("#char-count");
 const clearButton = document.querySelector("#clear-btn");
 const content = document.querySelector(".content");
+const databaseStatus = document.querySelector("#database-status");
+const databaseStatusDot = document.querySelector("#database-status-dot");
 const sessionKey = "skillquery-session-id";
 
+fetch("/health")
+  .then((response) => {
+    if (!response.ok) throw new Error("Database unavailable");
+    return response.json();
+  })
+  .then((health) => {
+    databaseStatus.textContent = health.database === "connected" ? "Database connected" : "Database unavailable";
+    databaseStatusDot.classList.toggle("disconnected", health.database !== "connected");
+  })
+  .catch(() => {
+    databaseStatus.textContent = "Database unavailable";
+    databaseStatusDot.classList.add("disconnected");
+  });
+
 let sessionId = localStorage.getItem(sessionKey);
+let clarificationContext = null;
 if (!sessionId) {
   sessionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
   localStorage.setItem(sessionKey, sessionId);
@@ -188,11 +205,12 @@ form.addEventListener("submit", async (event) => {
     const response = await fetch("/api/query", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({question: text, session_id: sessionId}),
+      body: JSON.stringify({question: text, session_id: sessionId, clarification_context: clarificationContext}),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Request failed.");
     loading.remove();
+    clarificationContext = data.clarification || null;
     addMessage("assistant", data.answer, extractOptions(data.answer), data);
     question.value = "";
     question.dispatchEvent(new Event("input"));
@@ -207,6 +225,7 @@ form.addEventListener("submit", async (event) => {
 
 clearButton.addEventListener("click", () => {
   chat.innerHTML = "";
+  clarificationContext = null;
   content.classList.remove("has-chat");
   answerSection.classList.add("hidden");
 });
